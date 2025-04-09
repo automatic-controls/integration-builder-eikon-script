@@ -1,0 +1,2038 @@
+/*
+  BSD 3-Clause License
+  Copyright (c) 2025, Dan Fox, Tyler Lee, Cameron Vogt
+  https://github.com/automatic-controls/integration-builder-eikon-script/
+*/
+import java.awt.BorderLayout as BL;
+import java.awt.FlowLayout;
+import java.awt.GridLayout;
+import javax.swing.SpringLayout;
+import static java.awt.GridBagConstraints.*;
+import javax.swing.filechooser.FileFilter;
+import javax.swing.JFileChooser;
+import java.awt.*;
+import java.awt.event.*;
+import javax.swing.*;
+import javax.swing.border.*;
+import javax.swing.WindowConstants as WC;
+import javax.swing.JOptionPane;
+import javax.swing.JTabbedPane;
+import javax.swing.JScrollPane;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.regex.*;
+import java.nio.*;
+import java.nio.file.*;
+import java.nio.channels.*;
+import java.io.*;
+import java.net.*;
+
+root = com.controlj.green.common.CJProductDirectories.getResourcesDir().toPath().resolve("integrationbuilder");
+if (!Files.exists(root.resolve("logicsymbols"))){
+  String s = "Please ensure Integration Builder is installed at: "+root.toString();
+  println(s);
+  JOptionPane.showMessageDialog(null, s);
+  return;
+}
+
+// Download and configure groovy-swing library if necessary
+try{
+  final Path bin = com.controlj.green.common.CJProductDirectories.getBinDir().toPath();
+  final Path launchFile = bin.resolve("launchers").resolve("EIKON.launch");
+  String launcher = new String(Files.readAllBytes(launchFile), java.nio.charset.StandardCharsets.UTF_8);
+  Pattern p = Pattern.compile("bin/lib/groovy-swing-\\d++(?:\\.\\d++)*+\\.jar;");
+  if (!p.matcher(launcher).find()){
+    p = Pattern.compile("bin/lib/groovy-(\\d++(?:\\.\\d++)*+)\\.jar;");
+    final Matcher m = p.matcher(launcher);
+    if (m.find()){
+      final String ver = m.group(1);
+      launcher = m.replaceFirst('$0bin/lib/groovy-swing-$1.jar;');
+      final Path groovyLib = bin.resolve("lib").resolve("groovy-swing-"+ver+".jar");
+      if (!Files.exists(groovyLib)){
+        final String repo = ver.charAt(0)==('3' as char)?"codehaus":"apache";
+        final String url = "https://repo1.maven.org/maven2/org/"+repo+"/groovy/groovy-swing/"+ver+"/groovy-swing-"+ver+".jar";
+        URLConnection connection = URI.create(url).toURL().openConnection();
+        try(
+          InputStream s = connection.getInputStream();
+          OutputStream t = Files.newOutputStream(groovyLib);
+        ){
+          int read;
+          byte[] buffer = new byte[8192];
+          while ((read = s.read(buffer, 0, 8192)) >= 0) {
+            t.write(buffer, 0, read);
+          }
+        }
+      }
+      final ByteBuffer buf = ByteBuffer.wrap(launcher.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      try(
+        FileChannel out = FileChannel.open(launchFile, StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+      ){
+        while (buf.hasRemaining()){
+          out.write(buf);
+        }
+      }
+      println("Libraries have been downloaded. Please restart EIKON to apply changes.");
+      JOptionPane.showMessageDialog(null, "Libraries have been downloaded. Please restart EIKON to apply changes.");
+      return;
+    }
+  }
+}catch(Throwable t){
+  t.printStackTrace(out);
+}
+
+// Define constants
+removeText = [];
+mbTypeMap = [
+  'bdt':'tn',
+  'bat':'tn',
+  'gai':'ani',
+  'gai2':'ani',
+  'gbi':'bni',
+  'gbi2':'bni',
+  'bavp':'avi',
+  'bbvp':'bvi',
+  'bmsvp':'msvi',
+  'bavs':'avo',
+  'bbvs':'bvo',
+  'bmsvs':'msvo',
+  'event':'alm',
+  'text':'txtb',
+  'parb':'bvi'
+];
+pointTypeMap = [
+  0:'AI',
+  1:'AO',
+  2:'AV',
+  3:'BI',
+  4:'BO',
+  5:'BV',
+  13:'MSI',
+  14:'MSO',
+  19:'MSV'
+];
+guiTypeMap = [
+  0:0,
+  1:1,
+  2:2,
+  3:3,
+  4:4,
+  5:5,
+  6:13,
+  7:14,
+  8:19
+];
+dataType = [
+  0  : 'AI',
+  1  : 'AO',
+  2  : 'AV',
+  3  : 'BI',
+  4  : 'BO',
+  5  : 'BV',
+  8  : 'DEV',
+  13 : 'MSI',
+  14 : 'MSO',
+  19 : 'MSV'
+];
+dataTypeStr = [
+  'AI'  : 0,
+  'AO'  : 1,
+  'AV'  : 2,
+  'BI'  : 3,
+  'BO'  : 4,
+  'BV'  : 5,
+  'MSI' : 13,
+  'MSO' : 14,
+  'MSV' : 19,
+  'MV'  : 19
+];
+xmlHeader = [
+  "<?xml version='1.0' encoding='UTF-8'?>\n",
+  "<bacnet>\n",
+  "  <device-list>\n",
+  "    <device id='DEVICE' type='8' name='' vendor-id='' vendor-name='' location='' model='' description='' revision='' discovery-date-time='${new Date().format("yyyy-MM-dd HH:mm:ss")}'>\n"
+];
+xmlFooter = [
+  '    </device>\n',
+  '  </device-list>\n',
+  '</bacnet>'
+];
+alarmKeyWords = [
+  'alarm',
+  'caution',
+  'freezestat',
+  'freeze',
+  'high limit',
+  'low limit',
+  'high static',
+  'low static',
+  'hi limit',
+  'lo limit',
+  'hi static',
+  'lo static',
+  'emergency',
+  'smoke detector',
+  'shutdown',
+  'fail',
+  'fault',
+  'failure',
+  'locked out',
+  'warning',
+  'tripped',
+  'overload',
+  'error',
+  'err',
+  'comm loss',
+  'invalid',
+  'unexpected'
+];
+colNumber =[
+  'A' : 0,
+  'B' : 1,
+  'C' : 2,
+  'D' : 3,
+  'E' : 4,
+  'F' : 5,
+  'G' : 6,
+  'H' : 7,
+  'I' : 8,
+  'J' : 9,
+  'K' : 10,
+  'L' : 11,
+  'M' : 12,
+  'N' : 13,
+  'O' : 14,
+  'P' : 15,
+  'Q' : 16,
+  'R' : 17,
+  'S' : 18,
+  'T' : 19,
+  'U' : 20,
+  'V' : 21,
+  'W' : 22,
+  'X' : 23,
+  'Y' : 24,
+  'Z' : 25,
+  'AA' : 26,
+  'AB' : 27,
+  'AC' : 28,
+  'AD' : 29,
+  'AE' : 30,
+  'AF' : 31,
+  'AG' : 32,
+  'AH' : 33,
+  'AI' : 34,
+  'AJ' : 35,
+  'AK' : 36,
+  'AL' : 37,
+  'AM' : 38,
+  'AN' : 39,
+  'AO' : 40,
+  'AP' : 41,
+  'AQ' : 42,
+  'AR' : 43,
+  'AS' : 44,
+  'AT' : 45,
+  'AU' : 46,
+  'AV' : 47,
+  'AW' : 48,
+  'AX' : 49,
+  'AY' : 50,
+  'AZ' : 51
+];
+preferences = root.resolve("preferences.conf");
+path = root.resolve("logicsymbols").toString();
+csvCanonicalPath = "";
+discoveryPath = "";
+refnames = new HashSet<String>(128);
+lblSet = new HashSet<String>(64);
+tempList = [];
+validPointTypes = [0,1,2,3,4,5,6,7,8];
+equipmentName = "";
+trendLogEnable = true;
+trendEnableHistorian = true;
+trendSampleTime = 300; // 5 minutes
+trendHistorianKeepForDays = 30;
+alarmMsgEnable = 1;
+returnMsgEnable = 1;
+alarmText = "\$source\$ is in \$new_state\$";
+returnText = "\$source\$ is \$new_state\$";
+isBlue = true;
+appendMBtype = 0;
+ani2bni2Type = false;
+refreshTime = 60; // 1 minute
+bacnetValuesVisible = true;
+dispNameSelection = 0;
+refNameSelection = 0;
+dispUnderSpaceEnabled = false;
+dispNoSpecialsEnabled = false;
+dispSpaceAfterCapEnabled = false;
+dispCapFirstEnabled = false;
+discovery = [];
+pointsList = [];
+commVTag = 1;
+lastDirPath = root.resolve("discovery-samples").toString();
+
+class BacnetObject {
+  int type;
+  int instance;
+  String name;
+  String description;
+  String availability;
+  BacnetObject(type = 0, instance = 0, name = "Name", description = "Description", availability = ""){
+    this.type = type;
+    this.instance = instance;
+    this.name = name;
+    this.description = description;
+    this.availability = availability;
+  }
+  String objectString(){
+    return "      <object id='${instance}' type='${type}' name='${name}' description='${description}' discovery-date-time='${new Date().format("yyyy-MM-dd HH:mm:ss")}'/>\n";
+  }
+}
+
+class Vars {
+  public static Script1 script = null;
+  private static ArrayList list = [];
+  private static int len = 0;
+  public static boolean exists(String lbl, log=script.logic){
+    for (def e:log.labels()){
+      if (e.name.equals(lbl)){
+        return true;
+      }
+    }
+    return false;
+  }
+  public static void rn(String a, String b, log=script.logic){
+    if (a.equals(b)){
+      return;
+    }
+    int i = list.indexOf(b);
+    if (i==-1){
+      if (exists(a,log)){
+        log.labels(a).rename("tmp${len}");
+      }
+      list[len++] = b;
+    }else if (exists(a,log)){
+      log.labels(a).rename("tmp${i}");
+    }
+  }
+  public static void rn(){
+    for (int i=0;i<len;i++){
+      script.logic.labels("tmp${i}").rename(list[i]);
+    }
+  }
+}
+Vars.script = this;
+
+// Function definitions
+def loadPreferences(){
+  try{
+    if (Files.exists(preferences)){
+      Properties p = new Properties();
+      try(
+        BufferedReader in = Files.newBufferedReader(preferences, java.nio.charset.StandardCharsets.UTF_8);
+      ){
+        p.load(in);
+      }
+      String s;
+      s = p.getProperty("validPointTypes");
+      if (s!=null){
+        String[] arr = s.split(",");
+        validPointTypes = new int[arr.length];
+        for (int i=0;i<arr.length;++i){
+          validPointTypes[i] = Integer.parseInt(arr[i]);
+        }
+      }
+      s = p.getProperty("equipmentName");
+      if (s!=null){ equipmentName = s; }
+      s = p.getProperty("trendLogEnable");
+      if (s!=null){ trendLogEnable = Boolean.parseBoolean(s); }
+      s = p.getProperty("trendEnableHistorian");
+      if (s!=null){ trendEnableHistorian = Boolean.parseBoolean(s); }
+      s = p.getProperty("trendSampleTime");
+      if (s!=null){ trendSampleTime = Integer.parseInt(s); }
+      s = p.getProperty("trendHistorianKeepForDays");
+      if (s!=null){ trendHistorianKeepForDays = Integer.parseInt(s); }
+      s = p.getProperty("alarmMsgEnable");
+      if (s!=null){ alarmMsgEnable = Integer.parseInt(s); }
+      s = p.getProperty("returnMsgEnable");
+      if (s!=null){ returnMsgEnable = Integer.parseInt(s); }
+      s = p.getProperty("isBlue");
+      if (s!=null){ isBlue = Boolean.parseBoolean(s); }
+      s = p.getProperty("appendMBtype");
+      if (s!=null){ appendMBtype = Integer.parseInt(s); }
+      s = p.getProperty("ani2bni2Type");
+      if (s!=null){ ani2bni2Type = Boolean.parseBoolean(s); }
+      s = p.getProperty("alarmText");
+      if (s!=null){ alarmText = s; }
+      s = p.getProperty("returnText");
+      if (s!=null){ returnText = s; }
+      s = p.getProperty("refreshTime");
+      if (s!=null){ refreshTime = Integer.parseInt(s); }
+      s = p.getProperty("bacnetValuesVisible");
+      if (s!=null){ bacnetValuesVisible = Boolean.parseBoolean(s); }
+      s = p.getProperty("dispNameSelection");
+      if (s!=null){ dispNameSelection = Integer.parseInt(s); }
+      s = p.getProperty("dispUnderSpaceEnabled");
+      if (s!=null){ dispUnderSpaceEnabled = Boolean.parseBoolean(s); }
+      s = p.getProperty("dispNoSpecialsEnabled");
+      if (s!=null){ dispNoSpecialsEnabled = Boolean.parseBoolean(s); }
+      s = p.getProperty("dispSpaceAfterCapEnabled");
+      if (s!=null){ dispSpaceAfterCapEnabled = Boolean.parseBoolean(s); }
+      s = p.getProperty("refNameSelection");
+      if (s!=null){ refNameSelection = Integer.parseInt(s); }
+      s = p.getProperty("dispCapFirstEnabled");
+      if (s!=null){ dispCapFirstEnabled = Boolean.parseBoolean(s); }
+      s = p.getProperty("lastDirPath");
+      if (s!=null){ lastDirPath = s; }
+    }
+  }catch(Throwable t){
+    println("An error occurred while loading preferences.");
+    t.printStackTrace(out);
+  }
+}
+def savePreferences(){
+  try{
+    Properties p = new Properties();
+    p.setProperty("validPointTypes", validPointTypes.join(","));
+    p.setProperty("equipmentName", equipmentName);
+    p.setProperty("trendLogEnable", String.valueOf(trendLogEnable));
+    p.setProperty("trendEnableHistorian", String.valueOf(trendEnableHistorian));
+    p.setProperty("trendSampleTime", String.valueOf(trendSampleTime));
+    p.setProperty("trendHistorianKeepForDays", String.valueOf(trendHistorianKeepForDays));
+    p.setProperty("alarmMsgEnable", String.valueOf(alarmMsgEnable));
+    p.setProperty("returnMsgEnable", String.valueOf(returnMsgEnable));
+    p.setProperty("isBlue", String.valueOf(isBlue));
+    p.setProperty("appendMBtype", String.valueOf(appendMBtype));
+    p.setProperty("ani2bni2Type", String.valueOf(ani2bni2Type));
+    p.setProperty("alarmText", alarmText);
+    p.setProperty("returnText", returnText);
+    p.setProperty("refreshTime", String.valueOf(refreshTime));
+    p.setProperty("bacnetValuesVisible", String.valueOf(bacnetValuesVisible));
+    p.setProperty("dispNameSelection", String.valueOf(dispNameSelection));
+    p.setProperty("dispUnderSpaceEnabled", String.valueOf(dispUnderSpaceEnabled));
+    p.setProperty("dispNoSpecialsEnabled", String.valueOf(dispNoSpecialsEnabled));
+    p.setProperty("dispSpaceAfterCapEnabled", String.valueOf(dispSpaceAfterCapEnabled));
+    p.setProperty("refNameSelection", String.valueOf(refNameSelection));
+    p.setProperty("dispCapFirstEnabled", String.valueOf(dispCapFirstEnabled));
+    p.setProperty("lastDirPath", lastDirPath);
+    try(
+      BufferedWriter out = Files.newBufferedWriter(preferences, java.nio.charset.StandardCharsets.UTF_8);
+    ){
+      p.store(out, null);
+    }
+  }catch(Throwable t){
+    println("An error occurred while saving preferences.");
+    t.printStackTrace(out);
+  }
+}
+def sortPointsByTypeAndId(pointsList, pointLocations) {
+  return pointLocations.sort { a, b ->
+    def typeA = pointsList.object[a].@type.toInteger();
+    def typeB = pointsList.object[b].@type.toInteger();
+    def idA = pointsList.object[a].@id.toInteger();
+    def idB = pointsList.object[b].@id.toInteger();
+    return typeA <=> typeB ?: idA <=> idB;
+  }
+}
+def splitLineCSV(line){
+  int len = line.length();
+  int i;
+  char c;
+  int tokens = 1;
+  boolean esc = false;
+  for (i=0;i<len;++i){
+    c = line.charAt(i);
+    if (esc){
+      if (c=='"'){
+        esc = false;
+      }
+    }else if (c==','){
+      ++tokens;
+    }else if (c=='"'){
+      esc = true;
+    }
+  }
+  final String[] arr = new String[tokens];
+  final StringBuilder sb = new StringBuilder();
+  int j = -1;
+  for (i=0;i<len;++i){
+    c = line.charAt(i);
+    if (esc){
+      if (c=='"'){
+        esc = false;
+      }else{
+        sb.append(c);
+      }
+    }else if (c==','){
+      arr[++j] = sb.toString();
+      //https://issues.apache.org/jira/browse/GROOVY-10429
+      //sb.setLength(0);
+      sb.delete(0,sb.length());
+    }else if (c=='"'){
+      esc = true;
+      if (sb.length()>0){
+        sb.append(c);
+      }
+    }else{
+      sb.append(c);
+    }
+  }
+  arr[++j] = sb.toString();
+  return arr;
+}
+def convertCSV(inputFile, startRow = 3, objectNameCol = 'A', objectTypeCol = 'B', objectInstanceCol = 'C', objectDescCol = 'D'){
+  def objectList = new StringBuilder();
+  objectNameCol = objectNameCol.toUpperCase();
+  objectTypeCol = objectTypeCol.toUpperCase();
+  objectInstanceCol = objectInstanceCol.toUpperCase();
+  objectDescCol = objectDescCol.toUpperCase();
+  try {
+    new File(inputFile).eachLine { line, lineNumber ->
+      if (lineNumber >= startRow){
+        def point = new BacnetObject();
+        String[] cells = splitLineCSV(line);
+        if (objectInstanceCol == objectTypeCol){
+          tempType = cells[colNumber[objectTypeCol]].toUpperCase();
+          // Checks if instance format in the column is AV:XX, BV:XX, etc.
+          if (tempType.contains(":")){
+            String[] arr = tempType.split(":");
+            point.type = dataTypeStr[arr[0]];
+            point.instance = arr[1].toInteger();
+          }else{
+            // Sorts out data other assumed instance formats of AVXX, BVXX, etc.
+            point.type = dataTypeStr[(tempType =~ /(?i)[a-z]++/)[0]];
+            point.instance = (tempType =~ /[\d]++/)[0].toInteger();
+          }
+        }else if (cells[colNumber[objectTypeCol]].isInteger()){
+          // Checks if object type is already a numerical value instead of AV, BV, etc, then assign to point
+          point.type = cells[colNumber[objectTypeCol]].toInteger();
+          point.instance = cells[colNumber[objectInstanceCol]].toInteger();
+        }else{
+          // All other cases convert the object type string to integer type
+          point.type = dataTypeStr[cells[colNumber[objectTypeCol]]];
+          point.instance = cells[colNumber[objectInstanceCol]].toInteger();
+        }
+        point.name = cells[colNumber[objectNameCol]];
+        point.description = cells[colNumber[objectDescCol]];
+        // Adds point to object list for xml processing
+        objectList.append(point.objectString());
+      }
+    };
+    def xml = new StringBuilder();
+    // Appends header to xml string
+    for (item in xmlHeader){
+      xml.append(item);
+    }
+    // Appends all integration points to xml string
+    for (item in objectList){
+      xml.append(item);
+    }
+    // Appends footer to xml string
+    for (item in xmlFooter){
+      xml.append(item);
+    }
+    return xml.toString();
+  }catch(Throwable t){
+    t.printStackTrace(out);
+    incorrectSetupDialog();
+    return null;
+  }
+}
+def helpDialog(){
+  swing = Class.forName("groovy.swing.SwingBuilder").getDeclaredConstructor().newInstance();
+  int sizex_02 = 400;
+  int sizey_02 = 250;
+  int locationx_02 = (1920 - sizex_02)/2;
+  int locationy_02 = (1080 - sizey_02)/2;
+  results = swing.frame(title:'Help', location:[locationx_02,locationy_02], size:[sizex_02,sizey_02]){
+    int discoveryRow01 = 0;
+    gridBagLayout();
+    // Line 1
+    label(
+      "<html><p style='width:250px'>Acceptable CSV Formats for the Object Type Column combined with the Object Instance Column: AV:## (BV:##), AV## (BV##), or separate columns can be used. If a column is formatted similar to AV:## (BV:##) or AV## (BV##), the Object Instance Column can be ignored.</p></html>",
+      constraints:gbc(
+        gridx:0,
+        gridy:discoveryRow01,
+        gridwidth:2,
+        anchor:LINE_START,
+        insets:[10,0,0,0]
+      )
+    );
+    discoveryRow01++;
+    // Line 2
+    label(
+      "<html><p style='width:250px'>If there is no Object Description Column in the spreadsheet, the Object Name Column is an alternative solution.</p></html>",
+      constraints:gbc(
+        gridx:0,
+        gridy:discoveryRow01,
+        gridwidth:2,
+        ipady:10,
+        anchor:LINE_START,
+        insets:[10,0,0,0]
+      )
+    );
+    discoveryRow01++;
+    // Line 3
+    button(
+      "Close",
+      constraints: gbc(
+        gridx:0,
+        gridy:discoveryRow01,
+        gridwidth:REMAINDER,
+        insets:[20,0,0,0],
+        ipadx:20
+      ),
+      actionPerformed:{
+        results.dispose();
+      }
+    );
+  };
+  results.show();
+}
+def incorrectSetupDialog(){
+  swing = Class.forName("groovy.swing.SwingBuilder").getDeclaredConstructor().newInstance();
+  int sizex_02 = 450;
+  int sizey_02 = 150;
+  int locationx_02 = (1920 - sizex_02)/2;
+  int locationy_02 = (1080 - sizey_02)/2;
+  results = swing.frame(title:'Incorrect File Type', location:[locationx_02,locationy_02], size:[sizex_02,sizey_02]){
+    int discoveryRow01 = 0;
+    gridBagLayout();
+    // Line 1
+    label(
+      "<html><p style='width: 250px'>Warning: The contents of the spreadsheet or the script parameters are not setup correctly. Please verify spreadsheet and script parameters.</p></html>",
+      constraints:gbc(
+        gridx:0,
+        gridy:discoveryRow01,
+        anchor:LINE_START,
+        fill:HORIZONTAL
+      )
+    );
+    discoveryRow01++;
+    // Line 2
+    button(
+      "Close",
+      constraints:gbc(
+        gridx:0,
+        gridy:discoveryRow01,
+        gridwidth:REMAINDER,
+        insets:[20,0,0,0],
+        ipadx:20
+      ),
+      actionPerformed:{
+        results.dispose();
+      }
+    );
+  };
+  results.show();
+}
+def displayName(int i, def microblock){
+  def text;
+  switch(dispNameSelection){
+    case 0:{
+      if (pointsList.object[i].@name.toString()){
+        text = pointsList.object[i].@name.toString();
+      }else{
+        text = pointsList.object[i].@description.toString();
+      }
+      break;
+    }
+    case 1:{
+      if (pointsList.object[i].@description.toString()){
+        text = pointsList.object[i].@description.toString();
+      }else{
+        text = pointsList.object[i].@name.toString();
+      }
+      break;
+    }
+  }
+  if (dispUnderSpaceEnabled){
+    text = text.replace("_"," ");
+  }
+  if (dispNoSpecialsEnabled){
+    text = text.replaceAll("[^a-zA-Z0-9 ]++", "");
+  }
+  if (dispCapFirstEnabled){
+    text = text.split("\\s++").collect { it.capitalize() }.join(" ");
+  }
+  if (appendMBtype==1){
+    text = text + mbTypeMap[microblock.type].replace("_"," ");
+  }
+  microblock.prop.'display name' = text;
+}
+def description(int i, def microblock){
+  description = microblock.prop.'display name';
+  if (description.size()>40){
+    description = description.substring(0, 40);
+  }
+  microblock.prop.description = description;
+}
+def referenceName(int i, def microblock){
+  def text;
+  switch (refNameSelection){
+    case 0:{
+      if (pointsList.object[i].@name.toString()){
+        text = pointsList.object[i].@name.toString();
+      }else{
+        text = pointsList.object[i].@description.toString();
+      }
+      break;
+    }
+    case 1:{
+      if (pointsList.object[i].@description.toString()){
+        text = pointsList.object[i].@description.toString();
+      }else{
+        text = pointsList.object[i].@name.toString();
+      }
+      break;
+    }
+  }
+  text = text.toLowerCase();
+  for (i=0;i<removeText.size();i++){
+    text = text.replaceAll(removeText[i],'');
+  }
+  text = text.replaceAll("[^_a-zA-Z0-9]++","_");
+  def nums = text.split("\\D++").join('_').replaceAll("_{2,}","_").replaceAll('^_|_$',"");
+  if (nums.length()>0){
+    nums = '_'+nums;
+  }
+  text = text.replaceAll("\\d++","").replaceAll("_{2,}","_").replaceAll('^_|_$',"");
+  def suffix = "";
+  if (microblock.propNames.contains('property page text')){
+    if (microblock.prop.'property page text'.toLowerCase().contains('polarity')){
+      suffix = '_plrty_'+mbTypeMap[microblock.type];
+    }else if (microblock.prop.'property page text'.toLowerCase().contains('enable')){
+      suffix = '_enbl_'+mbTypeMap[microblock.type];
+    }else{
+      suffix = '_'+mbTypeMap[microblock.type];
+    }
+  }else{
+    suffix = '_'+mbTypeMap[microblock.type];
+  }
+  suffix = nums+suffix;
+  if (text.length()+suffix.length()>40){
+    text = text.substring(0,40-suffix.length());
+  }
+  String orig = text;
+  String ii;
+  String fin = (text+suffix).replaceAll("_{2,}","_");
+  for (i=2;!refnames.add(fin);++i){
+    ii = String.valueOf(i);
+    text = orig;
+    if (text.length()+suffix.length()+ii.length()>39){
+      text = text.substring(0,39-suffix.length()-ii.length());
+    }
+    text = text+"_"+ii;
+    fin = (text+suffix).replaceAll("_{2,}","_");
+  }
+  microblock.prop.'reference name' = fin;
+}
+def networkPoint(int i, def microblock){
+  displayName(i, microblock);
+  referenceName(i, microblock);
+  microblock.prop.'address' = bacnetAddress[i];
+  microblock.prop.'refresh time' = refreshTime;
+}
+def analogTrend(int i, def microblock){
+  displayName(i, microblock);
+  referenceName(i, microblock);
+  description(i, microblock);
+  microblock.prop.'enable trend log' = trendLogEnable;
+  microblock.prop.'sample every' = trendSampleTime;
+  microblock.prop.'enable trend historian' = trendEnableHistorian;
+  microblock.prop.'keep historical trends for' = trendHistorianKeepForDays;
+}
+def analogBacnetValue(int i, def microblock){
+  displayName(i, microblock);
+  referenceName(i, microblock);
+  description(i, microblock);
+  microblock.prop.'network visible' = bacnetValuesVisible;
+  microblock.prop.'units' = 64;
+  // Need to make a function that looks up what units should be based on name, ie "Temperature" sets to degF, "Static Pressure" sets this to "inches W.C", etc
+}
+def binaryTrend(int i, def microblock){
+  displayName(i, microblock);
+  referenceName(i, microblock);
+  microblock.prop.'enable trend log' = trendLogEnable;
+  microblock.prop.'sample every' = trendSampleTime;
+  microblock.prop.'enable trend historian' = trendEnableHistorian;
+  microblock.prop.'keep historical trends for' = trendHistorianKeepForDays;
+}
+def binaryBacnetValue(int i, def microblock){
+  displayName(i, microblock);
+  referenceName(i, microblock);
+  description(i, microblock);
+  microblock.prop.'network visible' = bacnetValuesVisible;
+}
+def binaryValue(int i, def microblock){
+  referenceName(i, microblock);
+}
+def multiBacnetValue(int i, def microblock){
+  displayName(i, microblock);
+  referenceName(i, microblock);
+  description(i, microblock);
+  microblock.prop.'network visible' = bacnetValuesVisible;
+}
+def setAddressText(int i, String pointType, def figure){
+  figure.text = "bacnet://${pointsList.attribute('id')}/${pointTypeMap[pointsList.object[i].@type.toInteger()]}:${pointsList.object[i].@id.toInteger()}";
+}
+def setPointText(int i, String pointType, def figure){
+  figure.text = " " + pointsList.object[i].@name.toString() + " ";
+}
+def setPropertyPageText(int i, def microblock){
+  if (microblock.prop.'property page text' == "Point Name"){
+    microblock.prop.'property page text' = pointsList.object[i].@name.toString();
+  }
+}
+def bacnetAlarm(int i, def microblock){
+  displayName(i, microblock);
+  referenceName(i, microblock);
+  microblock.prop.'alarm text' = this.alarmText.toString();
+  microblock.prop.'return text' = this.returnText.toString();
+  microblock.prop.'return enabled' = returnMsgEnable;
+  microblock.prop.'alarm enabled' = alarmMsgEnable;
+}
+def getUniqueLabel(def lbl){
+  String ret = lbl;
+  for (int i=2;!lblSet.add(ret);++i){
+    ret = lbl+i;
+  }
+  return ret;
+}
+def renameLabel(int i, def type, def name, def logic){
+  if (type == 'alarm' || type == 'analog' || type == 'digital' || type == 'multistate') {
+    if (type == 'alarm') {
+      def startOfLabel = name.split("(?<=\\S)\\S*+\\s*+").join('').toUpperCase();
+      Vars.rn("LABEL", getUniqueLabel("${startOfLabel} AL"), logic);
+    }
+    Vars.rn("COMM", "V${commVTag}", logic);
+    commVTag = commVTag + 1;
+  }
+}
+def createAlarmLabel(int i){
+  def text;
+  switch(dispNameSelection){
+    case 0:{
+      if (pointsList.object[i].@name.toString()) {
+        text = pointsList.object[i].@name.toString();
+      } else {
+        text = pointsList.object[i].@description.toString();
+      }
+      break;
+    }
+    case 1:{
+      if (pointsList.object[i].@description.toString()) {
+        text = pointsList.object[i].@description.toString();
+      } else {
+        text = pointsList.object[i].@name.toString();
+      }
+      break;
+    }
+  }
+  if (dispUnderSpaceEnabled) {
+    text = text.replace("_"," ");
+  }
+  if (dispNoSpecialsEnabled) {
+    text = text.replaceAll("[^a-zA-Z0-9 ]++", "");
+  }
+  if (dispCapFirstEnabled) {
+    text = text.split("\\s++").collect { it.capitalize() }.join(" ");
+  }
+  text = text.toLowerCase();
+  for (i=0;i<removeText.size();i++){
+    text = text.replaceAll(removeText[i],'');
+  }
+  def startOfLabel = text.split("(?<=\\S)\\S*+\\s*+").join('').toUpperCase();
+  alarmLabels.add(getUniqueLabel("${startOfLabel} AL"));
+}
+def generateIntegration(pointsList){
+  try{
+    refnames.clear();
+    lblSet.clear();
+    def programHeaderPath = path+"\\blue\\program_header.logicsymbol";
+    def analogHeaderPath = path+"\\blue\\analog_header.logicsymbol";
+    def analogPointPath = path+"\\blue\\network_i_a.logicsymbol";
+    def digitalPointPath = path+"\\blue\\network_i_b.logicsymbol";
+    def multiPointPath = path+"\\blue\\network_i_m.logicsymbol";
+    def alarmPointPath = path+"\\blue\\network_alarm.logicsymbol";
+    def validAnalogPointPath = path+"\\blue\\network_i_a2.logicsymbol";
+    def validDigitalPointPath = path+"\\blue\\network_i_b2.logicsymbol";
+    def validMultiPointPath = path+"\\blue\\network_i_m2.logicsymbol";
+    def validAlarmPointPath = path+"\\blue\\network_alarm2.logicsymbol";
+    def digitalHeaderPath = path+"\\blue\\digital_header.logicsymbol";
+    def alarmHeaderPath = path+"\\blue\\alarm_header.logicsymbol";
+    def textColorLegendPath = path+"\\blue\\text_color_legend.logicsymbol";
+    def commA2B2ValidPath = path+"\\comm_a2_b2_valid.logicsymbol";
+    def pinkMSVText = path+"\\pink_text_msv.logicsymbol";
+    if (!isBlue) {
+      programHeaderPath = path+"\\gray\\program_header.logicsymbol";
+      analogHeaderPath = path+"\\gray\\analog_header.logicsymbol";
+      analogPointPath = path+"\\gray\\network_i_a.logicsymbol";
+      digitalPointPath = path+"\\gray\\network_i_b.logicsymbol";
+      multiPointPath = path+"\\gray\\network_i_m.logicsymbol";
+      alarmPointPath = path+"\\gray\\network_alarm.logicsymbol";
+      validAnalogPointPath = path+"\\gray\\network_i_a2.logicsymbol";
+      validDigitalPointPath = path+"\\gray\\network_i_b2.logicsymbol";
+      validMultiPointPath = path+"\\gray\\network_i_m2.logicsymbol";
+      validAlarmPointPath = path+"\\gray\\network_alarm2.logicsymbol";
+      digitalHeaderPath = path+"\\gray\\digital_header.logicsymbol";
+      alarmHeaderPath = path+"\\gray\\alarm_header.logicsymbol";
+      textColorLegendPath = path+"\\gray\\text_color_legend.logicsymbol";
+    }
+    def symbolPath = "";
+    def alarmWrapUpPath = "";
+    def analogPath = "";
+    def digitalPath = "";
+    def multiPath = "";
+    def alarmPath = "";
+    def pastFirstPoint = false;
+    def pointType = "";
+    def i = 0;
+    def analogCount = 0;
+    def digitalCount = 0;
+    def multiCount = 0;
+    def alarmCount = 0;
+    def headerCount = 0;
+    def analogPointLocations = [];
+    def digitalPointLocations = [];
+    def multiPointLocations = [];
+    def alarmPointLocations = [];
+    alarmLabels = [];
+    bacnetAddress = [];
+    println("variables initialized");
+    //This section will figure out where the valid point types are at and take down their locations in arrays for use later on.
+    //This is so the script can group up common points.
+    logic.append {
+      symbol(programHeaderPath) {
+        String date = new SimpleDateFormat("MM/dd/yyyy").format(new Date());
+        println("today's date is " + date);
+        String userName = System.getProperty("user.name");
+        figures {
+          if (type.equals('text-figure')){
+            if (delegate.text.contains("User Name")) {
+              delegate.text = userName;
+            } else if (delegate.text.contains("program_file_name")) {
+              delegate.text = (this.equipmentName.replaceAll("[^_a-zA-Z0-9]++","_").toLowerCase()+"_interface_bacnet").replaceAll("_{2,}","_");
+            } else if (delegate.text.contains("Program Name")) {
+              delegate.text = this.equipmentName + " Interface (BACnet)";
+            } else if (delegate.text.contains("0/00/0000")) {
+              println("Generating date");
+              delegate.text = date;
+            }
+          }
+        }
+      }
+    };
+    for (i=0;i<pointsList.object.size();i++) {
+      bacnetAddress[i] = "bacnet://${pointsList.attribute('id')}/${pointTypeMap[pointsList.object[i].@type.toInteger()]}:${pointsList.object[i].@id.toInteger()}";
+      if (validPointTypes.contains(pointsList.object[i].@type.toInteger())) {
+        println('"'+(pointsList.object[i].@description.isEmpty()?pointsList.object[i].@name:pointsList.object[i].@description) + "\" is a valid point of type " + pointTypeMap[pointsList.object[i].@type.toInteger()]);
+        switch (pointsList.object[i].@type.toInteger()){
+          case [0, 1, 2]:{
+            analogPointLocations.add(i);
+            analogCount++;
+            break;
+          }
+          case [3, 4, 5]:{
+            if (alarmKeyWords.any{pointsList.object[i].@description.toLowerCase().contains(it)} || alarmKeyWords.any{pointsList.object[i].@name.toLowerCase().contains(it)}) {
+              alarmCount++;
+              alarmPointLocations.add(i);
+              createAlarmLabel(i);
+            } else {
+              digitalCount++;
+              digitalPointLocations.add(i);
+            }
+            break;
+          }
+          case [13, 14, 19]:{
+            multiPointLocations.add(i);
+            multiCount++;
+            break;
+          }
+        }
+      }
+    }
+    lblSet.clear();
+    // Sort all groups by type and then by object id
+    analogPointLocations = sortPointsByTypeAndId(pointsList, analogPointLocations);
+    digitalPointLocations = sortPointsByTypeAndId(pointsList, digitalPointLocations);
+    multiPointLocations = sortPointsByTypeAndId(pointsList, multiPointLocations);
+    alarmPointLocations = sortPointsByTypeAndId(pointsList, alarmPointLocations);
+    println("""-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+    I found ${analogCount+multiCount+alarmCount+digitalCount} valid points.
+    Moving on, now it's time to start actually generating the points.""");
+    //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+    //Time to actually generate points! This section will run through all the valid points we have found,
+    //evaluate the point types and lay down the appropriate logic symbol, and then set all the display names, reference names, labels, etc.
+    // Starting with program color
+    def totalAlarmLabels = 0;
+    if (alarmLabels) {
+      int s = alarmLabels.size();
+      if (s>0 && s<70){
+        totalAlarmLabels = 5+(int)((s-2)/4)*4;
+        if (isBlue){
+          alarmWrapUpPath = path+"\\blue\\alarm_wrapup_${totalAlarmLabels}.logicsymbol";
+        }else{
+          alarmWrapUpPath = path+"\\gray\\alarm_wrapup_${totalAlarmLabels}.logicsymbol";
+        }
+      }else if (isBlue){
+        alarmWrapUpPath = path+'\\blue\\alarm_wrapup_0.logicsymbol';
+      }else{
+        alarmWrapUpPath = path+'\\gray\\alarm_wrapup_0.logicsymbol';
+      }
+    }else if (isBlue){
+      alarmWrapUpPath = path+'\\blue\\alarm_wrapup_0.logicsymbol';
+    }else{
+      alarmWrapUpPath = path+'\\gray\\alarm_wrapup_0.logicsymbol';
+    }
+    logic.append {
+      symbol(alarmWrapUpPath) {
+        figures {
+          if (type.equals('text-figure') && delegate.text.contains("x.0")) {
+            headerCount++;
+            delegate.text = headerCount + ".0";
+          }
+        }
+        for (i=0;i<this.alarmLabels.size();i++) {   //Changes the labels to our alarm labels
+          Vars.rn("LABEL ${i+1}", this.alarmLabels[i], delegate);
+        }
+        for (i=this.alarmLabels.size();i<totalAlarmLabels;i++) {   //Changes whatever labels are left over to NOT USED
+          if (labels("LABEL ${i+1}")) {
+            labels("LABEL ${i+1}").rename("NOT USED");
+          }
+        }
+      }
+    }
+    // Add the commA2B2 Valid logic symbol if all ANI2/BNI2 are selected
+    if (ani2bni2Type == true){
+      logic.append {
+        symbol(commA2B2ValidPath) {
+          int totalValidLabels = 401;
+          int validLabels = analogCount + multiCount + alarmCount + digitalCount;
+          for (int j=validLabels;j<totalValidLabels;j++){
+            //Changes whatever labels are left over to NOT USED
+            Vars.rn("V${j+1}", "ON", delegate);
+          }
+        }
+      }
+    }
+    // Create Analog Header if analog points exist
+    if (analogPointLocations) {
+      logic.append {
+        symbol(analogHeaderPath) {
+          figures {
+            if (type.equals('text-figure') && delegate.text.contains("x.0")) {
+              headerCount++;
+              delegate.text = headerCount + ".0";
+            }
+          }
+        }
+      }
+    }
+    // Append logic symbols
+    for (i=0;i<analogPointLocations.size();i++) {
+      pointType = 'analog';
+      if(!pastFirstPoint) {
+        analogPath = validAnalogPointPath;
+        if (ani2bni2Type != true){
+          pastFirstPoint = true;
+        }
+      } else {
+        analogPath = analogPointPath;
+      }
+      logic.append {
+        symbol(analogPath) {
+          def nameForLabel = "";
+          microblocks {
+            if (type.contains('gai')) {
+              this.networkPoint(analogPointLocations[i], delegate);
+              nameForLabel = prop.'display name';
+            }
+            if (type.contains('bat')) {
+              this.analogTrend(analogPointLocations[i], delegate);
+            }
+            if (type.contains('bavs')) {
+              this.analogBacnetValue(analogPointLocations[i], delegate);
+            }
+            if (type.contains('text')) {
+              this.setPropertyPageText(analogPointLocations[i], delegate);
+            }
+          }
+          if (this.ani2bni2Type == true){
+            this.renameLabel(analogPointLocations[i], pointType, nameForLabel, delegate);
+          }
+          figures {
+            if (type.equals('text-figure')){
+              if (delegate.text.contains(" Point Name ")) {
+                this.setPointText(analogPointLocations[i], pointType, delegate);
+              }
+              if (delegate.text.contains("Address")) {
+                this.setAddressText(analogPointLocations[i], pointType, delegate);
+              }
+            }
+          }
+        }
+      }
+    }
+    println("Done with analog points");
+    // Append multi state logic symbols to Analog section
+    if (multiPointLocations.size()>0) {
+      logic.append{
+        symbol(pinkMSVText);
+      }
+    }
+    for (i=0;i<multiPointLocations.size();i++) {
+      pointType = 'multistate';
+      if(!pastFirstPoint) {
+        multiPath = validMultiPointPath;
+        if (ani2bni2Type != true){
+          pastFirstPoint = true;
+        }
+      } else {
+        multiPath = multiPointPath;
+      }
+      logic.append {
+        symbol(multiPath) {
+          def nameForLabel = "";
+          microblocks {
+            if (type.contains('gai')) {
+              this.networkPoint(multiPointLocations[i], delegate);
+              nameForLabel = prop.'display name';
+            }
+            if (type.contains('bat')) {
+              this.analogTrend(multiPointLocations[i], delegate);
+            }
+            if (type.contains('bmsvs')) {
+              this.multiBacnetValue(multiPointLocations[i], delegate);
+            }
+            if (type.contains('text')) {
+              this.setPropertyPageText(multiPointLocations[i], delegate);
+            }
+          }
+          if (this.ani2bni2Type == true){
+            this.renameLabel(multiPointLocations[i], pointType, nameForLabel, delegate);
+          }
+          figures {
+            if (type.equals('text-figure')){
+              if (delegate.text.contains(" Point Name ")) {
+                this.setPointText(multiPointLocations[i], pointType, delegate);
+              }
+              if (delegate.text.contains("Address")) {
+                this.setAddressText(multiPointLocations[i], pointType, delegate);
+              }
+            }
+          }
+        }
+      }
+    }
+    println("Done with multi-state points");
+    // Create Digital Header if analog/multistate points exist
+    if (digitalPointLocations) {
+      logic.append {
+        symbol(digitalHeaderPath) {
+          figures {
+            if(type.equals('text-figure') && delegate.text.contains("x.0")) {
+              headerCount++;
+              delegate.text = headerCount + ".0";
+            }
+          }
+        }
+      }
+    }
+    // Append logic symbols
+    for (i=0;i<digitalPointLocations.size();i++) {
+      pointType = 'digital';
+      if(!pastFirstPoint) {
+        symbolPath = validDigitalPointPath;
+        if (ani2bni2Type != true){
+          pastFirstPoint = true;
+        }
+      } else {
+        symbolPath = digitalPointPath;
+      }
+      logic.append {
+        symbol(symbolPath) {
+          def nameForLabel = "";
+          microblocks {
+            if (type.contains('gbi')) {
+              this.networkPoint(digitalPointLocations[i], delegate);
+              nameForLabel = prop.'display name';
+            }
+            if (type.contains('bdt')) {
+              this.binaryTrend(digitalPointLocations[i], delegate);
+            }
+            if (type.contains('bbvs')) {
+              this.binaryBacnetValue(digitalPointLocations[i], delegate);
+            }
+            if (type.contains('parb')) {
+              this.binaryValue(digitalPointLocations[i], delegate);
+            }
+            if (type.contains('text')) {
+              this.setPropertyPageText(digitalPointLocations[i], delegate);
+            }
+          }
+          if (this.ani2bni2Type == true){
+            this.renameLabel(digitalPointLocations[i], pointType, nameForLabel, delegate);
+          }
+          figures {
+            if (type.equals('text-figure')){
+              if (delegate.text.contains(" Point Name ")) {
+                this.setPointText(digitalPointLocations[i], pointType, delegate);
+              }
+              if (delegate.text.contains("Address")) {
+                this.setAddressText(digitalPointLocations[i], pointType, delegate);
+              }
+            }
+          }
+        }
+      }
+    }
+    println("Done with digital points");
+    if (alarmPointLocations) {
+      logic.append {
+        symbol(alarmHeaderPath) {
+          figures {
+            if (type.equals('text-figure') && delegate.text.contains("x.0")) {
+              headerCount++;
+              delegate.text = headerCount + ".0";
+            }
+          }
+        }
+      }
+    }
+    for (i=0;i<alarmPointLocations.size();i++) {
+      pointType = 'alarm';
+      symbolPath = validAlarmPointPath;
+      logic.append {
+        symbol(symbolPath) {
+          def nameForLabel = "";
+          microblocks {
+            if (type.contains('gbi')) {
+              this.networkPoint(alarmPointLocations[i], delegate);
+              nameForLabel = prop.'display name';
+            }
+            if (type.contains('event')) {
+              this.bacnetAlarm(alarmPointLocations[i], delegate);
+            }
+            if (type.contains('text')) {
+              this.setPropertyPageText(alarmPointLocations[i], delegate);
+            }
+            if (type.contains('bdt')) {
+              this.binaryTrend(alarmPointLocations[i], delegate);
+            }
+            if (type.contains('bbvs')) {
+              this.binaryBacnetValue(alarmPointLocations[i], delegate);
+            }
+            if (type.contains('parb')) {
+              this.binaryValue(alarmPointLocations[i], delegate);
+            }
+          }
+          this.renameLabel(alarmPointLocations[i], pointType, nameForLabel, delegate);
+          figures {
+            if (type.equals('text-figure')){
+              if (delegate.text.contains(" Point Name ")) {
+                this.setPointText(alarmPointLocations[i], pointType, delegate);
+              }
+              if (delegate.text.contains("Address")) {
+                this.setAddressText(alarmPointLocations[i], pointType, delegate);
+              }
+            }
+          }
+        }
+      }
+    }
+    println("Done with alarm points");
+    logic.append {
+      symbol(textColorLegendPath);
+    }
+    Vars.rn();
+    println("""Script has finished running. Point Counts: ${digitalCount+analogCount+alarmCount} Total points
+    ${analogCount} Analogs
+    ${multiCount} Analogs
+    ${digitalCount} Digitals
+    ${alarmCount} Alarms""");
+  }catch(Throwable t){
+    t.printStackTrace(out);
+  }
+}
+
+//=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+//Graphical functions
+def showPreview() {
+  def preview = swing.frame(title:'XML Preview', size:[500,300]) {
+    panel {
+      borderLayout()
+      scrollPane( verticalScrollBarPolicy:JScrollPane.VERTICAL_SCROLLBAR_ALWAYS ) {
+        table() {
+          tableModel(list:pointsList.object) {
+            closureColumn(
+              header:'Name',
+              read:{row -> return row.@name},
+              write:{ row, val -> row.@name = val}
+            )
+            closureColumn(
+              header:'Description',
+              read:{row -> return row.@description},
+              write:{ row, val -> row.@description = val}
+            )
+            closureColumn(
+              header:'Object Type',
+              read:{row -> return pointTypeMap[row.@type.toInteger()]},
+              write:{ row, val -> row.@type = pointTypeMap.find{ it.value == val}?.key}
+            )
+            closureColumn(
+              header:'Object ID',
+              read:{row -> return row.@id.toInteger()},
+              write:{ row, val -> row.@id = val}
+            )
+          }
+        }
+      }
+    }
+  };
+  preview.show();
+}
+def dispUpdateText(String text, boolean underSpace, boolean noSpecials, boolean dispSpaceBeforeCap, boolean capFirst) {
+  if (underSpace) {
+    text = text.replace("_", " ");
+  }
+  if (noSpecials) {
+    text = text.replaceAll("[^a-zA-Z0-9 ]++", "");
+  }
+  if (dispSpaceBeforeCap) {
+    for (i=1;i<text.size();i++) {
+      if (Character.isUpperCase(text.charAt(i)) && Character.isLowerCase(text.charAt(i-1))) {
+        text = text.substring(0,i) + " " + text.substring(i,text.size());
+      }
+    }
+  }
+  if (capFirst) {
+    text = text.split("\\s++").collect { it.capitalize() }.join(" ");
+  }
+  return text;
+}
+def refUpdateText(String text) {
+  text = text.replace(" ", "_");
+  text = text.replaceAll("[^_a-zA-Z0-9]++", "");
+  text = text.toLowerCase();
+  return text;
+}
+
+// Main GUI Setup and Entry Point
+try{
+  loadPreferences();
+  def openDiscoveryDialog = new JFileChooser(
+    dialogTitle: "Choose a discovery or CSV file",
+    currentDirectory: new File(lastDirPath),
+    fileSelectionMode: JFileChooser.FILES_ONLY,
+    fileFilter: [
+      getDescription: {-> "*.discovery,*.csv"},
+      accept:{ file-> file ==~ /.*?\.(?:discovery|csv)/ || file.isDirectory() }
+    ] as FileFilter
+  );
+  def defaultInsets = [0,0,10,0];
+  swing = Class.forName("groovy.swing.SwingBuilder").getDeclaredConstructor().newInstance();
+  int sizex_01 = 650;
+  int sizey_01 = 650;
+  gui = swing.frame(
+    title:'Integration Builder',
+    size:[sizex_01,sizey_01]
+  ){
+    menuBar {
+      menu(text:'Preview') {
+        menuItem() {
+          action(
+            name:'Preview XML Data',
+            closure:{
+              showPreview();
+            }
+          )
+        }
+      }
+    }
+    gridBagLayout()
+    panel(constraints: gbc(gridx:0,gridy:0,gridwidth:REMAINDER, fill:HORIZONTAL)) {
+      label(
+        icon:imageIcon(path+'\\ib_logo.png'),
+        constraints:gbc(anchor:CENTER)
+      )
+    }
+    def typeMap = [
+      0:"name",
+      1:"description"
+    ];
+    tabbedPane(id: 'tabs', tabLayoutPolicy:JTabbedPane.SCROLL_TAB_LAYOUT) {
+      panel(name:"Essentials") {
+        int ibRow01 = 0;
+        gridBagLayout();
+        // Row 1
+        checkBox(
+          id:"isBlueBox",
+          text:"Blue Borders",
+          selected:isBlue,
+          constraints:gbc(
+            gridx:0,
+            gridy:ibRow01,
+            gridwidth:REMAINDER,
+            anchor:WEST
+          )
+        );
+        ibRow01++;
+        // Row 2
+        checkBox(
+          id:"appendMBtypeBox",
+          text:"Append MB Type as Suffix to Display Name",
+          selected:(appendMBtype==1),
+          constraints:gbc(
+            gridx:0,
+            gridy:ibRow01,
+            gridwidth:REMAINDER,
+            anchor:WEST
+          )
+        );
+        ibRow01++;
+        // Row 3
+        checkBox(
+          id:"ani2bni2TypeBox",
+          text:"All ANI2/BNI2",
+          selected:ani2bni2Type,
+          constraints:gbc(
+            gridx:0,
+            gridy:ibRow01,
+            gridwidth:REMAINDER,
+            anchor:WEST
+          )
+        );
+        ibRow01++;
+        // Row 4
+        button(
+          "Check all",
+          constraints: gbc(
+            gridx:0,
+            gridy:ibRow01,
+            gridwidth:1,
+            insets:[10,0,0,0],
+            ipadx:27,
+            ipady:5,
+            anchor:LINE_START
+          ),
+          actionPerformed: {
+            isBlueBox.selected = true
+            appendMBtypeBox.selected = true
+            ani2bni2TypeBox.selected = true
+          }
+        );
+        button(
+          "Uncheck all",
+          constraints: gbc(
+            gridx:1,
+            gridy:ibRow01,
+            gridwidth:1,
+            insets:[10,0,0,0],
+            ipadx:27,
+            ipady:5,
+            anchor:CENTER
+          ),
+          actionPerformed: {
+            isBlueBox.selected = false
+            appendMBtypeBox.selected = false
+            ani2bni2TypeBox.selected = false
+          }
+        );
+        ibRow01++;
+        // Row 5
+        label(
+          "Equipment Name: ",
+          constraints:gbc(
+            gridx:0,
+            gridy:ibRow01,
+            insets:[20,0,0,0],
+            anchor:EAST
+          )
+        );
+        textField(
+          id:"equipmentNameBox",
+          text:equipmentName,
+          constraints:gbc(
+            gridx:1,
+            gridy:ibRow01,
+            insets:[20,0,0,0],
+            ipadx:100,
+            gridwidth:REMAINDER,
+            fill:HORIZONTAL
+          )
+        );
+        ibRow01++
+        // Row 6
+        button(
+          "Browse",
+          constraints:gbc(
+            gridx:0,
+            gridy:ibRow01,
+            anchor:EAST
+          ),
+          actionPerformed: {
+            println();
+            result = openDiscoveryDialog.showOpenDialog();
+            switch (result){
+              case JFileChooser.APPROVE_OPTION:{
+                discoveryPath =  openDiscoveryDialog.getSelectedFile();
+                lastDirPath = discoveryPath.getParent();
+                println "file name="+discoveryPath.toString();
+                if (discoveryPath.toString().endsWith(".csv")){
+                  csvCanonicalPath = discoveryPath.getCanonicalPath();
+                  int _sizex_01 = 325;
+                  int _sizey_01 = 450;
+                  int _locationx_01 = (1920 - _sizex_01)/2;
+                  int _locationy_01 = (1080 - _sizey_01)/2;
+                  gui2 = swing.frame(title:'CSV Helper', location:[_locationx_01,_locationy_01], size:[_sizex_01,_sizey_01]) {
+                    menuBar {
+                      menu(text:'Help') {
+                        menuItem() {
+                          action(name:'View Help', closure:{ helpDialog() })
+                        }
+                      }
+                    }
+                    gridBagLayout()
+                    tabbedPane(id: 'tabs', tabLayoutPolicy:JTabbedPane.SCROLL_TAB_LAYOUT, constraints:gbc(ipadx:50)){
+                      panel(name:'General'){
+                        discoveryRow01 = 0;
+                        gridBagLayout();
+                        // Line 1
+                        label(
+                          "Select CSV parameters: ",
+                          constraints:gbc(gridx:0,gridy:discoveryRow01,anchor:LINE_START,ipady:10)
+                        );
+                        discoveryRow01++;
+                        // Line 2
+                        label(
+                          "Object Name Column: ",
+                          constraints:gbc(gridx:0,gridy:discoveryRow01,insets:[5,0,0,0],anchor:LINE_START)
+                        );
+                        textField(
+                          id:"objectNameColText",
+                          text:'A',
+                          editable:true,
+                          constraints:gbc(gridx:1,gridy:discoveryRow01,insets:[5,0,0,0],ipadx:20,anchor:LINE_START)
+                        );
+                        discoveryRow01++;
+                        // Line 3
+                        label(
+                          "Object Type Column: ",
+                          constraints:gbc(gridx:0,gridy:discoveryRow01,insets:[5,0,0,0],anchor:LINE_START)
+                        );
+                        textField(
+                          id:"objectTypeColText",
+                          text:'B',
+                          editable:true,
+                          constraints:gbc(gridx:1,gridy:discoveryRow01,insets:[5,0,0,0],ipadx:20,anchor:LINE_START)
+                        );
+                        discoveryRow01++;
+                        // Line 4
+                        label(
+                          "Object Instance Column: ",
+                          constraints:gbc(gridx:0,gridy:discoveryRow01,insets:[5,0,0,0],anchor:LINE_START)
+                        );
+                        textField(
+                          id:"objectInstanceColText",
+                          text:'C',
+                          editable:true,
+                          constraints:gbc(gridx:1,gridy:discoveryRow01,insets:[5,0,0,0],ipadx:20,anchor:LINE_START)
+                        );
+                        discoveryRow01++;
+                        // Line 5
+                        label(
+                          "Object Description Column: ",
+                          constraints:gbc(gridx:0,gridy:discoveryRow01,insets:[5,0,0,0],anchor:LINE_START)
+                        );
+                        textField(
+                          id:"objectDescColText",
+                          text:'A',
+                          editable:true,
+                          constraints:gbc(gridx:1,gridy:discoveryRow01,insets:[5,0,0,0],ipadx:20,anchor:LINE_START)
+                        );
+                        discoveryRow01++;
+                        // Line 6
+                        label(
+                          "Starting Object Row: ",
+                          constraints:gbc(gridx:0,gridy:discoveryRow01,insets:[5,0,0,0],anchor:LINE_START)
+                        );
+                        textField(
+                          id:"startRowText",
+                          text:'2',
+                          editable:true,
+                          constraints:gbc(gridx:1,gridy:discoveryRow01,insets:[5,0,0,0],ipadx:20,anchor:LINE_START)
+                        );
+                        discoveryRow01++;
+                      }
+                    }
+                    button(
+                      "Load",
+                      constraints: gbc(gridx:0,gridy:2,gridwidth:REMAINDER,insets:[20,0,0,0],ipadx:20,ipady:20),
+                      actionPerformed: {
+                        objectNameCol = objectNameColText.text.replace(' ','').toUpperCase();
+                        objectTypeCol = objectTypeColText.text.replace(' ','').toUpperCase();
+                        objectInstanceCol = objectInstanceColText.text.replace(' ','').toUpperCase();
+                        objectDescCol = objectDescColText.text.replace(' ','').toUpperCase();
+                        startRow = startRowText.text.replace(' ','').toInteger();
+                        toFile = convertCSV(csvCanonicalPath, startRow, objectNameCol, objectTypeCol, objectInstanceCol, objectDescCol);
+                        if (!(toFile == null)){
+                          discovery = new XmlParser().parseText(toFile);
+                          // Since we're only working with 1 device, there's only 1 points list.
+                          // Easier to read code if we don't see "discovery.'device-list'.device[0]" everywhere
+                          pointsList = discovery.'device-list'.device[0];
+                          switch (dispNameSelectBox.getSelectedIndex()){
+                            case 0:{
+                              dispBeforeText.text = pointsList.object[0].@name.toString();
+                              break;
+                            }
+                            case 1:{
+                              dispBeforeText.text = pointsList.object[0].@description.toString();
+                              break;
+                            }
+                          }
+                          switch (refNameSelectBox.getSelectedIndex()){
+                            case 0:{
+                              refBeforeText.text = pointsList.object[0].@name.toString();
+                              refAfterText.text = refUpdateText(pointsList.object[0].@name.toString());
+                              break;
+                            }
+                            case 1:{
+                              refBeforeText.text = pointsList.object[0].@description.toString();
+                              refAfterText.text = refUpdateText(pointsList.object[0].@description.toString());
+                              break;
+                            }
+                          }
+                          gui2.dispose();
+                          discoveryFilePathBox.text = discoveryPath.toString();
+                          println("You can now preview the points");
+                        }
+                      }
+                    )
+                  }
+                  gui2.show();
+                }else{
+                  // Reads info from discovery file
+                  discovery = new XmlParser().parse(discoveryPath);
+                  // Since we're only working with 1 device, there's only 1 points list.
+                  // Easier to read code if we don't see "discovery.'device-list'.device[0]" everywhere
+                  pointsList = discovery.'device-list'.device[0];
+                  switch (dispNameSelectBox.getSelectedIndex()){
+                    case 0:{
+                      dispBeforeText.text = pointsList.object[0].@name.toString();
+                      break;
+                    }
+                    case 1:{
+                      dispBeforeText.text = pointsList.object[0].@description.toString();
+                      break;
+                    }
+                  }
+                  switch (refNameSelectBox.getSelectedIndex()){
+                    case 0:{
+                      refBeforeText.text = pointsList.object[0].@name.toString();
+                      refAfterText.text = refUpdateText(pointsList.object[0].@name.toString());
+                      break;
+                    }
+                    case 1:{
+                      refBeforeText.text = pointsList.object[0].@description.toString();
+                      refAfterText.text = refUpdateText(pointsList.object[0].@description.toString());
+                      break;
+                    }
+                  }
+                  discoveryFilePathBox.text = discoveryPath.toString();
+                  println("You can now preview the points");
+                }
+                break;
+              }
+              case JFileChooser.CANCEL_OPTION:{
+                break;
+              }
+              case JFileChooser.ERROR_OPTION:{
+                break;
+              }
+            }
+          }
+        )
+        textField(
+          id:"discoveryFilePathBox",
+          editable:false,
+          constraints:gbc(
+            gridx:1,
+            gridy:ibRow01,
+            ipadx:100,
+            gridwidth:REMAINDER,
+            fill:HORIZONTAL
+          )
+        )
+        ibRow01++;
+        label(
+          "Select point Types:",
+          constraints:gbc(
+            gridx:0,
+            gridy:ibRow01,
+            anchor:CENTER,
+            gridwidth:REMAINDER
+          )
+        )
+        ibRow01++;
+        list(
+          id: "selectedPointTypes",
+          constraints:gbc(
+            gridx:0,
+            gridy:ibRow01,
+            anchor:CENTER,
+            gridwidth:REMAINDER
+          ),
+          items: pointTypeMap.collect{ key, value -> value},
+          selectedIndices: validPointTypes
+        )
+      }
+      panel(name:"Trends") {
+        gridBagLayout()
+        checkBox(
+          id:"trendLog",
+          text:"Enable Trend Log",
+          selected:trendLogEnable,
+          constraints:gbc(gridx:0,gridy:0,gridwidth:REMAINDER,anchor:WEST)
+        )
+        label(
+          "Trend Sample Time (sec): ",
+          constraints:gbc(gridx:0,gridy:1,anchor:EAST)
+        )
+        textField(
+          id:"trendSampleT",
+          text:String.valueOf(trendSampleTime),
+          constraints:gbc(gridx:1,gridy:1,ipadx:100,gridwidth:REMAINDER, fill:HORIZONTAL,anchor:WEST)
+        )
+        checkBox(
+          id:"trendHistorian",
+          text:"Enable Trend Historian",
+          selected:trendEnableHistorian,
+          constraints:gbc(gridx:0,gridy:2,gridwidth:REMAINDER,anchor:WEST)
+        )
+        label(
+          "Keep historical trends for (days): ",
+          constraints:gbc(gridx:0,gridy:3,anchor:EAST)
+        )
+        textField(
+          id:"trendHistorianTime",
+          text:String.valueOf(trendHistorianKeepForDays),
+          constraints:gbc(gridx:1,gridy:3,ipadx:100,gridwidth:REMAINDER,fill:HORIZONTAL,anchor:WEST)
+        )
+      }
+      panel(name:"Alarms") {
+        gridBagLayout()
+        checkBox(
+          id:"alarmMsgEnableCheck",
+          text:"Enable Alarm Text",
+          selected:(alarmMsgEnable==1),
+          constraints:gbc(gridx:0,gridy:0,gridwidth:REMAINDER,anchor:WEST)
+        )
+        label(
+          "Alarm Text: ",
+          constraints:gbc(gridx:0,gridy:1,anchor:EAST)
+        )
+        textField(
+          id:"alarmTextBox",
+          text:alarmText,
+          constraints:gbc(gridx:1,gridy:1,ipadx:100,gridwidth:REMAINDER,fill:HORIZONTAL,anchor:EAST)
+        )
+        checkBox(
+          id:"returnMsgEnableCheck",
+          text:"Enable Return Text",
+          selected:(returnMsgEnable==1),
+          constraints:gbc(gridx:0,gridy:2,gridwidth:REMAINDER,anchor:WEST)
+        )
+        label(
+          "Return Text: ",
+          constraints:gbc(gridx:0,gridy:3,anchor:EAST)
+        )
+        textField(
+          id:"returnTextBox",
+          text:returnText,
+          constraints:gbc(gridx:1,gridy:3,ipadx:100,gridwidth:REMAINDER,fill:HORIZONTAL,anchor:EAST)
+        )
+      }
+      panel(name:"Display Name") {
+        def i = 0;
+        gridBagLayout()
+        label("Select XML field for display name:", constraints:gbc(gridx:0,gridy:0,anchor:WEST))
+        comboBox(
+          id:"dispNameSelectBox",
+          items:['Name', 'Description'],
+          selectedIndex:dispNameSelection,
+          constraints:gbc(gridx:0,gridy:1,ipadx:20,anchor:WEST),
+          actionPerformed:{
+            switch (dispNameSelectBox.getSelectedIndex()){
+              case 0:{
+                dispBeforeText.text = pointsList.object[0].@name.toString();
+                break;
+              }
+              case 1:{
+                dispBeforeText.text = pointsList.object[0].@description.toString();
+                break;
+              }
+            }
+          }
+        )
+        button(
+          "Prev",
+          constraints: gbc(gridx:1,gridy:1,insets:[20,0,0,0],ipadx:20,ipady:20),
+          actionPerformed: {
+            def text;
+            i--;
+            switch (dispNameSelectBox.getSelectedIndex()){
+              case 0:{
+                text = pointsList.object[i].@name.toString();
+                break;
+              }
+              case 1:{
+                text = pointsList.object[i].@description.toString();
+                break;
+              }
+            }
+            dispBeforeText.text = dispUpdateText(text, dispUnderSpace.isSelected(), dispNoSpecials.isSelected(), dispSpaceBeforeCap.isSelected(), dispCapFirst.isSelected());
+          }
+        )
+        button(
+          "Next",
+          constraints: gbc(gridx:2,gridy:1,insets:[20,0,0,0],ipadx:20,ipady:20),
+          actionPerformed: {
+            def text;
+            i++;
+            switch (dispNameSelectBox.getSelectedIndex()){
+              case 0:{
+                text = pointsList.object[i].@name.toString();
+                break;
+              }
+              case 1:{
+                text = pointsList.object[i].@description.toString();
+                break;
+              }
+            }
+            dispBeforeText.text = dispUpdateText(text, dispUnderSpace.isSelected(), dispNoSpecials.isSelected(), dispSpaceBeforeCap.isSelected(), dispCapFirst.isSelected());
+          }
+        )
+        label(
+          "Before:",
+          constraints:gbc(gridx:0, gridy:2, anchor:WEST)
+        )
+        textField(
+          id:"dispBeforeText",
+          text:"Open a discovery file first",
+          editable:false,
+          constraints:gbc(gridx:1,gridy:2,ipadx:150,gridwidth:REMAINDER,anchor:WEST)
+        )
+        label(
+          "After:",
+          constraints:gbc(gridx:0, gridy:3, anchor:WEST)
+        )
+        textField(
+          id:"dispAfterText",
+          text:bind(source:dispBeforeText,sourceProperty:'text'),
+          editable:false,
+          constraints:gbc(gridx:1,gridy:3,ipadx:150,gridwidth:REMAINDER,anchor:WEST)
+        )
+        checkBox(
+          id:"dispUnderSpace",
+          text:"Replace _ with a space",
+          constraints:gbc(gridx:0,gridy:4,gridwidth:REMAINDER,anchor:WEST),
+          actionPerformed:{
+            dispAfterText.text = dispUpdateText(dispBeforeText.text, dispUnderSpace.isSelected(), dispNoSpecials.isSelected(), dispSpaceBeforeCap.isSelected(), dispCapFirst.isSelected());
+          },
+          selected:dispUnderSpaceEnabled
+        )
+        checkBox(
+          id:"dispNoSpecials",
+          text:"Remove Special Characters",
+          constraints:gbc(gridx:0,gridy:5,gridwidth:REMAINDER,anchor:WEST),
+          actionPerformed:{
+            dispAfterText.text = dispUpdateText(dispBeforeText.text, dispUnderSpace.isSelected(), dispNoSpecials.isSelected(), dispSpaceBeforeCap.isSelected(), dispCapFirst.isSelected());
+          },
+          selected:dispNoSpecialsEnabled
+        )
+        checkBox(
+          id:"dispSpaceBeforeCap",
+          text:"Insert Space before Capital Letters",
+          constraints:gbc(gridx:0,gridy:6,gridwidth:REMAINDER,anchor:WEST),
+          actionPerformed:{
+            dispAfterText.text = dispUpdateText(dispBeforeText.text, dispUnderSpace.isSelected(), dispNoSpecials.isSelected(), dispSpaceBeforeCap.isSelected(), dispCapFirst.isSelected());
+          },
+          selected:dispSpaceAfterCapEnabled
+        )
+        checkBox(
+          id:"dispCapFirst",
+          text:"Capitalize First Letters",
+          constraints:gbc(gridx:0,gridy:7,gridwidth:REMAINDER,anchor:WEST),
+          actionPerformed:{
+            dispAfterText.text = dispUpdateText(dispBeforeText.text, dispUnderSpace.isSelected(), dispNoSpecials.isSelected(), dispSpaceBeforeCap.isSelected(), dispCapFirst.isSelected());
+          },
+          selected:dispCapFirstEnabled
+        )
+      }
+      panel(name:"Reference Name") {
+        def i = 0;
+        gridBagLayout()
+        label(
+          "Select XML field for reference name:",
+          constraints:gbc(gridx:0,gridy:0, anchor:WEST)
+        )
+        comboBox(
+          id:"refNameSelectBox",
+          items:['Name', 'Description'],
+          selectedIndex:refNameSelection,
+          constraints:gbc(gridx:0,gridy:1,ipadx:20, anchor:WEST),
+          actionPerformed:{
+            switch (refNameSelectBox.getSelectedIndex()){
+              case 0:{
+                refBeforeText.text = pointsList.object[0].@name.toString();
+                refAfterText.text = refUpdateText(pointsList.object[0].@name.toString());
+                break;
+              }
+              case 1:{
+                refBeforeText.text = pointsList.object[0].@description.toString();
+                refAfterText.text = refUpdateText(pointsList.object[0].@description.toString());
+                break;
+              }
+            }
+          }
+        )
+        button(
+          "Prev",
+          constraints: gbc(gridx:1,gridy:1, insets:[20,0,0,0], ipadx:20,ipady:20),
+          actionPerformed: {
+            def text;
+            i--;
+            switch(refNameSelectBox.getSelectedIndex()){
+              case 0:{
+                text = pointsList.object[i].@name.toString();
+                break;
+              }
+              case 1:{
+                text = pointsList.object[i].@description.toString();
+                break;
+              }
+            }
+            refBeforeText.text = text;
+            refAfterText.text = refUpdateText(text);
+          }
+        )
+        button(
+          "Next",
+          constraints: gbc(gridx:2,gridy:1, insets:[20,0,0,0], ipadx:20,ipady:20),
+          actionPerformed: {
+            def text;
+            i++;
+            switch (refNameSelectBox.getSelectedIndex()){
+              case 0:{
+                text = pointsList.object[i].@name.toString();
+                break;
+              }
+              case 1:{
+                text = pointsList.object[i].@description.toString();
+                break;
+              }
+            }
+            refBeforeText.text = text;
+            refAfterText.text = refUpdateText(text);
+          }
+        )
+        label(
+          "Before:",
+          constraints:gbc(gridx:0, gridy:2, anchor:WEST)
+        )
+        textField(
+          id:"refBeforeText",
+          text:"Open a discovery file first",
+          editable:false,
+          constraints:gbc(gridx:1,gridy:2,ipadx:150, gridwidth:REMAINDER, anchor:WEST)
+        )
+        label(
+          "After:",
+          constraints:gbc(gridx:0, gridy:3, anchor:WEST)
+        )
+        textField(
+          id:"refAfterText",
+          text:"Open a discovery file first",
+          editable:false,
+          constraints:gbc(gridx:1,gridy:3,ipadx:150,gridwidth:REMAINDER,anchor:WEST)
+        )
+      }
+      panel(name:"Network Parameters") {
+        def i = 0;
+        gridBagLayout()
+        checkBox(
+          id:"bacnetVisible",
+          text:"Bacnet values network visible",
+          selected:bacnetValuesVisible,
+          constraints:gbc(gridx:0,gridy:5,anchor:CENTER)
+        )
+        label(
+          "Network Point Refresh Time (sec)",
+          constraints:gbc(gridx:0,gridy:6)
+        )
+        textField(
+          id:"refreshTimeBox",
+          text:String.valueOf(refreshTime),
+          constraints:gbc(gridx:0,gridy:7,ipadx:30)
+        )
+      }
+    }
+    button(
+      "Generate",
+      constraints: gbc(gridx:0,gridy:2,gridwidth:REMAINDER,insets:[20,0,0,0],ipadx:20,ipady:20),
+      actionPerformed: {
+        validPointTypes = selectedPointTypes.getSelectedIndices();
+        equipmentName = equipmentNameBox.text.toString();
+        trendLogEnable = trendLog.isSelected();
+        trendEnableHistorian = trendHistorian.isSelected();
+        trendSampleTime = trendSampleT.text.toInteger();
+        trendHistorianKeepForDays = trendHistorianTime.text.toInteger();
+        if (alarmMsgEnableCheck.isSelected()) {
+          alarmMsgEnable = 1;
+        } else {
+          alarmMsgEnable = 0;
+        }
+        if(returnMsgEnableCheck.isSelected()) {
+          returnMsgEnable = 1;
+        } else {
+          returnMsgEnable = 0;
+        }
+        alarmText = alarmTextBox.text.toString();
+        returnText = returnTextBox.text.toString();
+        println("use blue borders = " + isBlueBox.isSelected());
+        isBlue = isBlueBox.isSelected();
+        println("Append MB type = " + appendMBtypeBox.isSelected());
+        if (appendMBtypeBox.isSelected()) {
+          appendMBtype = 1;
+        } else {
+          appendMBtype = 0;
+        }
+        println("All ANI2/BNI2 = " + ani2bni2TypeBox.isSelected());
+        ani2bni2Type = ani2bni2TypeBox.isSelected();
+        refreshTime = refreshTimeBox.text.toInteger();
+        bacnetValuesVisible = bacnetVisible.isSelected();
+        dispNameSelection = dispNameSelectBox.getSelectedIndex();
+        refNameSelection = refNameSelectBox.getSelectedIndex();
+        dispUnderSpaceEnabled = dispUnderSpace.isSelected();
+        dispNoSpecialsEnabled = dispNoSpecials.isSelected();
+        dispSpaceAfterCapEnabled = dispSpaceBeforeCap.isSelected();
+        dispCapFirstEnabled = dispCapFirst.isSelected();
+        savePreferences();
+        trendSampleTime*=100;
+        for (int i=0;i<validPointTypes.size();i++){
+          tempList.add(guiTypeMap[validPointTypes[i]]);
+        }
+        validPointTypes = tempList;
+        tempList = [];
+        commVTag = 1;
+        generateIntegration(pointsList);
+        gui.dispatchEvent(new WindowEvent(gui, WindowEvent.WINDOW_CLOSING));
+      }
+    )
+  }
+  gui.show();
+}catch(Throwable t){
+  t.printStackTrace(out);
+}
