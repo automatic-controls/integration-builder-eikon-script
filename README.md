@@ -7,7 +7,7 @@ WebCTRL is a trademark of Automated Logic Corporation.  Any other trademarks men
 
 ## Overview
 
-Integration Builder is a groovy script which is meant to be executed in the EIKON application. [EIKON](https://www.automatedlogic.com/en/products/webctrl-building-automation-system/engineering-tools/eikon/) is a graphical programming tool which comes installed alongside [WebCTRL](https://www.automatedlogic.com/en/products/webctrl-building-automation-system/). Compatability has been tested for use with WebCTRL9.0 only. The purpose of this script is to generate a control program using data from a BACnet discovery file in either CSV or XML format. The script generates input and output network points as well as basic alarming logic.
+Integration Builder is a groovy script which is meant to be executed in the EIKON application. [EIKON](https://www.automatedlogic.com/en/products/webctrl-building-automation-system/engineering-tools/eikon/) is a graphical programming tool which comes installed alongside [WebCTRL](https://www.automatedlogic.com/en/products/webctrl-building-automation-system/). Compatability has been tested for use with WebCTRL9.0 only. The purpose of this script is to generate a control program using data from a BACnet discovery file in either CSV or XML format. The script generates input network points as well as basic alarming logic.
 
 ## Installation
 
